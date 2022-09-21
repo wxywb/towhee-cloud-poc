@@ -1,7 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 import os
 import json
-import shutil
 import numpy as np
 import towhee
 import threading
@@ -19,7 +18,7 @@ class InferenceService():
         emb_function = (
           towhee.dummy_input['path']()
             .image_decode['path', 'img']()
-            .image_embedding.timm['img', 'vec'](model_name='resnet101')
+            .image_embedding.timm['img', 'vec'](model_name='resnet50')
             .select['vec']()
             .as_function()
             )
@@ -51,8 +50,12 @@ class InferenceService():
         while True:
             obj = self.q_data.get().result()
             pidx, tmp_path, path = obj 
-            emb = self.pipeline(tmp_path)
-            self.return_embs.append((pidx, tmp_path, emb.vec, path))
+            try:
+                emb = self.pipeline(tmp_path)
+                vec = emb.vec 
+            except Exception as e:
+                vec = np.ones(1) * -1
+            self.return_embs.append((pidx, tmp_path, vec, path))
             if len(self.return_embs) == self.processed_num_td:
                 self.mutex.release()
             os.remove(tmp_path)
@@ -62,6 +65,7 @@ class Service(Flask):
     def __init__(self, pool_capacity=10, *args, **kwargs):
         self.iservice = InferenceService()
         self.executor = ThreadPoolExecutor(max_workers=4)
+        self.s3 = boto3.client('s3')
         super(Service, self).__init__(*args, **kwargs)    
         @self.route('/predict', methods=['POST'])
         def predict():
@@ -69,7 +73,7 @@ class Service(Flask):
             data = json.loads(data)
             len_data = len(data['path'])
             ordered_paths = [(i, data['path'][i]) for i in range(len(data['path']))]
-            print('inference {} images.'.format(len_data))
+        #    print('inference {} images.'.format(len_data))
             for opath in ordered_paths:
                 fut = self.executor.submit(self.download, opath) 
                 fut.add_done_callback(self.download_callback)
@@ -79,16 +83,15 @@ class Service(Flask):
             return json_ret
 
     def download(self, path):
-        print('downloading {}'.format(path))
         pidx, path_name = path
         ext_name = os.path.splitext(path_name)[-1]
         prefix = str(uuid.uuid4())
-        shutil.copyfile(path_name, './tmp/'+prefix+ext_name )
+        basename = os.path.basename(path_name)
+        os.system('aws s3 cp {} tmp/{}{}'.format(path_name,prefix,ext_name))
         tmp_path = './tmp/{}{}'.format(prefix, ext_name)
         return (pidx,tmp_path,path_name)
 
     def download_callback(self, path):
-        print('put', path)
         self.iservice.q_data.put(path)
 
     def generate_response(self, embs):
